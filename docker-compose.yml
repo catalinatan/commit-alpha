@@ -1,0 +1,193 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# commit-alpha — real-time streaming layer
+#
+# Brings up a single-broker Kafka cluster, creates the two project topics, and
+# starts the three Python services that produce / consume / sink the stream.
+#
+# Topics
+#   github.activity   (3 partitions, RF=1)  ← webhook-listener writes here
+#   signals.alerts    (3 partitions, RF=1)  ← signal-consumer writes here
+#                                             bigquery-sink reads from here
+#
+# Kafka listeners (dual)
+#   PLAINTEXT://kafka:9092       ← inter-container traffic (what the Python
+#                                  services use; matches the spec)
+#   PLAINTEXT_HOST://localhost:29092
+#                                ← exposed on the host for ad-hoc CLI tools
+#                                  (kcat, kafka-console-consumer, etc.)
+#
+# Usage
+#   docker compose up -d
+#   docker compose logs -f signal-consumer
+#   docker compose down -v               # also removes broker state volumes
+#
+# Notes
+#   - The Python streaming scripts (streaming/*.py) are mounted from the host;
+#     they will be added in subsequent tasks. Until they exist, those three
+#     services will start, fail to find their entrypoint, and restart — which is
+#     expected. Kafka itself comes up cleanly.
+#   - pip install runs on container start for the Python services. Fine for dev;
+#     switch to per-service Dockerfiles when you're ready to harden.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Zookeeper ──────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: commit-alpha-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      # `ruok` returns `imok` when the ZK server is accepting connections.
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── Kafka broker ──────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: commit-alpha-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"       # inter-container listener (also reachable from host)
+      - "29092:29092"     # host listener — use localhost:29092 from your laptop
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Single-broker dev cluster — replication factor 1 across the board.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Force explicit topic creation (kafka-setup handles it). Prevents
+      # silently-misnamed topics from being autocreated by typos in producers.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      # Probes the actual broker API (not just TCP). Returns 0 once the broker
+      # has registered with ZK and is accepting client requests.
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  # ── Topic bootstrap (one-shot) ────────────────────────────────────────────
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: commit-alpha-kafka-setup
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # --if-not-exists makes this idempotent across restarts.
+    command: |
+      bash -c "
+        set -e
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic github.activity --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic signals.alerts  --partitions 3 --replication-factor 1
+        echo '─ topics after setup ─'
+        kafka-topics --bootstrap-server kafka:9092 --list
+      "
+    restart: "no"
+
+  # ── Streaming services ────────────────────────────────────────────────────
+  # All three share the same skeleton: mount the repo, pip-install on boot,
+  # exec the script. They wait for both Kafka health AND for kafka-setup to
+  # finish, so the topics they reference are guaranteed to exist.
+
+  webhook-listener:
+    image: python:3.11-slim
+    container_name: commit-alpha-webhook-listener
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_GITHUB_ACTIVITY: github.activity
+      WEBHOOK_HOST: 0.0.0.0
+      WEBHOOK_PORT: "8080"
+      # Set via your shell or a .env file at the repo root.
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "pip install --quiet --no-cache-dir
+        kafka-python fastapi 'uvicorn[standard]' pydantic
+        && python streaming/webhook_listener.py"
+    restart: unless-stopped
+
+  signal-consumer:
+    image: python:3.11-slim
+    container_name: commit-alpha-signal-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_INPUT: github.activity
+      KAFKA_TOPIC_OUTPUT: signals.alerts
+      KAFKA_CONSUMER_GROUP: signal-consumer
+      # Path inside the container to the model artifact saved by models/classifier.py
+      MODEL_PATH: /app/models/artifacts/gbm.joblib
+      PYTHONUNBUFFERED: "1"
+    command: >
+      bash -c "pip install --quiet --no-cache-dir
+        kafka-python scikit-learn pandas numpy joblib scipy
+        && python streaming/signal_consumer.py"
+    restart: unless-stopped
+
+  bigquery-sink:
+    image: python:3.11-slim
+    container_name: commit-alpha-bigquery-sink
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    working_dir: /app
+    volumes:
+      - ./:/app
+      # Mount a GCP service-account key at ./secrets/gcp-key.json (gitignored).
+      # If it doesn't exist yet, create an empty file or comment this line out.
+      - ./secrets:/secrets:ro
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_INPUT: signals.alerts
+      KAFKA_CONSUMER_GROUP: bigquery-sink
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcp-key.json
+      GCP_PROJECT_ID:    ${GCP_PROJECT_ID:-}
+      BIGQUERY_DATASET:  ${BIGQUERY_DATASET:-commit_alpha}
+      BIGQUERY_TABLE:    ${BIGQUERY_TABLE:-signals}
+      PYTHONUNBUFFERED: "1"
+    command: >
+      bash -c "pip install --quiet --no-cache-dir
+        kafka-python google-cloud-bigquery
+        && python streaming/bigquery_sink.py"
+    restart: unless-stopped
