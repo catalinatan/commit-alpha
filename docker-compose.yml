@@ -126,15 +126,15 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC_GITHUB_ACTIVITY: github.activity
       WEBHOOK_HOST: 0.0.0.0
-      WEBHOOK_PORT: "8080"
+      WEBHOOK_PORT: "8001"
       # Set via your shell or a .env file at the repo root.
-      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
       PYTHONUNBUFFERED: "1"
     ports:
-      - "8080:8080"
+      - "8001:8001"
     command: >
       bash -c "pip install --quiet --no-cache-dir
-        kafka-python fastapi 'uvicorn[standard]' pydantic
+        confluent-kafka fastapi 'uvicorn[standard]' pydantic
         && python streaming/webhook_listener.py"
     restart: unless-stopped
 
