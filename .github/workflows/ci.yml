@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-validate:
+    name: Tests + Sharpe gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx
+
+      # ── Unit / smoke tests (synthetic fixtures — no network needed) ────────
+      - name: Run smoke tests
+        run: pytest tests/ -v --tb=short
+
+      # ── Sharpe gate ───────────────────────────────────────────────────────
+      # Only runs if a cached signals.csv exists in the repo. Without one CI
+      # has nothing reproducible to score the model on, so we skip rather than
+      # silently pass.
+      - name: Check for cached signals fixture
+        id: signals
+        run: |
+          if [ -f data/signals.csv ]; then
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+            echo "Cached signals fixture found — running Sharpe gate."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No data/signals.csv committed; Sharpe gate skipped. Commit a fixture to enable it."
+          fi
+
+      - name: Sharpe gate (validation set)
+        if: steps.signals.outputs.exists == 'true'
+        run: python scripts/validate_sharpe.py
+
+      # ── FastAPI import check ──────────────────────────────────────────────
+      - name: Verify FastAPI app loads
+        run: python -c "from api.main import app; print('FastAPI app OK —', len(app.routes), 'routes')"

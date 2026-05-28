@@ -1,8 +1,9 @@
 """
 commit-alpha — GitHub activity → stock returns alpha signal pipeline.
 
-Tier 1  (steps 1–5):  data ingestion, forward returns, correlation heatmap
-Tier 2  (steps 6–8):  walk-forward ML classification, long/short Sharpe backtest
+Tier 1  (steps 1–5):   data ingestion, forward returns, correlation heatmap
+Tier 2  (steps 6–8):   walk-forward ML classification, long/short Sharpe backtest
+Tier 3  (steps 9–10):  alpha-decay curve, permutation-test overfit check
 
 Usage:
     export GITHUB_TOKEN=ghp_...
@@ -18,6 +19,12 @@ from data.github_fetcher import fetch_all_github_signals
 from data.price_fetcher import fetch_price_data
 from features.returns import compute_forward_log_returns
 from analysis.correlation import compute_correlations, plot_correlation_heatmap
+from analysis.alpha_decay import compute_alpha_decay, plot_alpha_decay
+from analysis.permutation_test import (
+    run_permutation_test,
+    summarise_permutation_test,
+    plot_permutation_distribution,
+)
 from models.classifier import run_walk_forward_classification
 from strategy.sharpe import (
     compute_long_short_returns,
@@ -33,8 +40,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 SIGNALS_PATH      = os.path.join("data",    "signals.csv")
+OOS_PREDS_PATH    = os.path.join("data",    "oos_predictions.csv")
 HEATMAP_PATH      = os.path.join("outputs", "correlation_heatmap.png")
 STRATEGY_PLOT     = os.path.join("outputs", "strategy_returns.png")
+DECAY_PLOT        = os.path.join("outputs", "alpha_decay.png")
+PERMUTATION_PLOT  = os.path.join("outputs", "permutation_test.png")
 
 SIGNAL_COLS = ["commit_count", "contributor_count", "star_count"]
 RETURN_COLS = [f"fwd_ret_{h}d" for h in config.RETURNS_HORIZONS]
@@ -99,7 +109,7 @@ def main() -> None:
     os.makedirs("outputs", exist_ok=True)
 
     # ── 1. GitHub signals ─────────────────────────────────────────────────────
-    logger.info("━━━ Step 1 / 8  Fetching GitHub signals ━━━")
+    logger.info("━━━ Step 1 / 10 Fetching GitHub signals ━━━")
     github_df = fetch_all_github_signals(
         ticker_to_repo=config.TICKER_TO_REPO,
         github_token=config.GITHUB_TOKEN,
@@ -109,7 +119,7 @@ def main() -> None:
     logger.info(f"GitHub signals: {len(github_df):,} rows | {github_df['ticker'].nunique()} tickers")
 
     # ── 2. Stock prices ───────────────────────────────────────────────────────
-    logger.info("━━━ Step 2 / 8  Fetching stock prices ━━━")
+    logger.info("━━━ Step 2 / 10 Fetching stock prices ━━━")
     price_df = fetch_price_data(
         tickers=config.TICKERS,
         start_date=config.START_DATE,
@@ -118,12 +128,12 @@ def main() -> None:
     logger.info(f"Price data: {len(price_df):,} rows | {price_df['ticker'].nunique()} tickers")
 
     # ── 3. Forward returns ────────────────────────────────────────────────────
-    logger.info("━━━ Step 3 / 8  Computing forward log returns ━━━")
+    logger.info("━━━ Step 3 / 10 Computing forward log returns ━━━")
     returns_df = compute_forward_log_returns(price_df, horizons=config.RETURNS_HORIZONS)
     logger.info(f"Returns: {len(returns_df):,} rows | horizons: {config.RETURNS_HORIZONS}d")
 
     # ── 4. Join signals + returns ─────────────────────────────────────────────
-    logger.info("━━━ Step 4 / 8  Joining signals and returns ━━━")
+    logger.info("━━━ Step 4 / 10 Joining signals and returns ━━━")
     signals_df = join_signals_and_returns(github_df, returns_df)
 
     # Drop rows where any signal or return is missing
@@ -138,7 +148,7 @@ def main() -> None:
     logger.info(f"Signals saved → {SIGNALS_PATH}")
 
     # ── 5. Correlation study ──────────────────────────────────────────────────
-    logger.info("━━━ Step 5 / 8  Running correlation study ━━━")
+    logger.info("━━━ Step 5 / 10 Running correlation study ━━━")
     pearson_df, spearman_df = compute_correlations(signals_df, SIGNAL_COLS, RETURN_COLS)
 
     print("\n" + "=" * 55)
@@ -154,7 +164,7 @@ def main() -> None:
     plot_correlation_heatmap(pearson_df, spearman_df, HEATMAP_PATH)
 
     # ── 6. Walk-forward ML classification ────────────────────────────────────
-    logger.info("━━━ Step 6 / 8  Walk-forward classification ━━━")
+    logger.info("━━━ Step 6 / 10 Walk-forward classification ━━━")
     lr_results, gbm_results, oos_preds = run_walk_forward_classification(
         signals_df, n_splits=5
     )
@@ -163,7 +173,7 @@ def main() -> None:
     _print_model_results("Gradient Boosting",   gbm_results)
 
     # ── 7. Long/short strategy ────────────────────────────────────────────────
-    logger.info("━━━ Step 7 / 8  Long/short strategy backtest ━━━")
+    logger.info("━━━ Step 7 / 10 Long/short strategy backtest ━━━")
     # Use GBM probabilities as the ranking signal; fall back to LR if needed
     ls_returns = compute_long_short_returns(oos_preds, signal_col="gbm_prob")
     summary = summarise_strategy(ls_returns)
@@ -175,8 +185,48 @@ def main() -> None:
     print()
 
     # ── 8. Strategy chart ─────────────────────────────────────────────────────
-    logger.info("━━━ Step 8 / 8  Saving strategy returns chart ━━━")
+    logger.info("━━━ Step 8 / 10 Saving strategy returns chart ━━━")
     plot_strategy_returns(ls_returns, STRATEGY_PLOT)
+
+    # Persist OOS predictions — consumed by the FastAPI service and CI gate.
+    oos_preds.to_csv(OOS_PREDS_PATH, index=False)
+    logger.info(f"OOS predictions saved → {OOS_PREDS_PATH}")
+
+    # ── 9. Alpha decay across horizons ───────────────────────────────────────
+    logger.info("━━━ Step 9 / 10 Alpha-decay analysis ━━━")
+    decay_df = compute_alpha_decay(
+        oos_preds, signals_df,
+        horizons=config.RETURNS_HORIZONS,
+        score_col="gbm_prob",
+    )
+    print("\n" + "=" * 55)
+    print("  Alpha Decay — Signal Power by Forward Horizon")
+    print("=" * 55)
+    print(decay_df.to_string())
+    print()
+    plot_alpha_decay(decay_df, DECAY_PLOT)
+
+    # ── 10. Permutation test (overfit / significance check) ──────────────────
+    logger.info(
+        f"━━━ Step 10 / 10 Permutation test ({config.PERMUTATION_N} shuffles) ━━━"
+    )
+    perm_result = run_permutation_test(
+        oos_preds,
+        signal_col="gbm_prob",
+        return_col="fwd_ret_5d",
+        n_permutations=config.PERMUTATION_N,
+        seed=config.PERMUTATION_SEED,
+    )
+    print("\n" + "=" * 55)
+    print("  Permutation Test — Observed Sharpe vs Null Distribution")
+    print("=" * 55)
+    print(summarise_permutation_test(perm_result).to_string())
+    if perm_result["p_value"] < 0.05:
+        print("  → reject H0 (no skill) at α=0.05")
+    else:
+        print("  → cannot reject H0 — observed Sharpe is plausibly luck")
+    print()
+    plot_permutation_distribution(perm_result, PERMUTATION_PLOT)
 
     logger.info("Pipeline complete.")
 

@@ -26,4 +26,14 @@ END_DATE   = "2025-05-01"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 # ── Return horizons (trading days) ────────────────────────────────────────────
-RETURNS_HORIZONS = [1, 5, 20]
+# 5d is the ML target; 1d / 3d / 10d / 20d feed the alpha-decay analysis.
+RETURNS_HORIZONS = [1, 3, 5, 10, 20]
+
+# ── Tier 3 ─ overfit / permutation test ──────────────────────────────────────
+PERMUTATION_N = 1000        # standard quant-research default
+PERMUTATION_SEED = 42
+
+# ── Tier 3 ─ CI gate ─────────────────────────────────────────────────────────
+# The CI workflow fails if the OOS Sharpe falls below this threshold. Set it
+# conservatively so genuine improvements pass and regressions get caught.
+CI_SHARPE_THRESHOLD = 0.30
